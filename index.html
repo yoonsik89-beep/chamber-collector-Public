@@ -55,6 +55,13 @@
   input { width: 100%; font: inherit; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); }
   .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
   .empty { color: var(--ink-3); padding: 24px; text-align: center; background: var(--card); border: 1px dashed var(--line); border-radius: 14px; }
+  .saver { position: fixed; inset: 0; background: #000; display: none; z-index: 100; cursor: none; }
+  .saver.on { display: block; }
+  .saver-box { position: absolute; color: #4a4a48; text-align: center; transition: left 2s ease, top 2s ease; user-select: none; }
+  .sv-time { font-size: 44px; font-weight: 300; font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
+  .sv-stat { font-size: 15px; margin-top: 4px; }
+  .sv-stat.wn { color: #b07a1c; } .sv-stat.er { color: #c4504b; }
+  .sv-hint { font-size: 11px; margin-top: 8px; color: #2e2e2d; }
   #log { font: 12px/1.5 ui-monospace, Menlo, Consolas, monospace; color: var(--ink-2); max-height: 220px; overflow: auto; white-space: pre-wrap; }
 </style>
 </head>
@@ -89,6 +96,8 @@
     <input id="cfgInterval" type="number" min="10" step="10">
     <label>수집기 이름 (태블릿이 여러 대일 때 구분용)</label>
     <input id="cfgCollector">
+    <label>화면 보호 시작 (분) — 이 시간 동안 손대지 않으면 화면을 어둡게 바꿉니다. 0이면 사용 안 함</label>
+    <input id="cfgSaver" type="number" min="0" step="1">
     <label>수집할 센서 (비우면 모두) — 센서ID 일부를 쉼표로 구분</label>
     <input id="cfgOnly" placeholder="예: 5179_1A2B, 5179_3C4D">
     <div class="row">
@@ -103,6 +112,15 @@
     <div id="log"></div>
   </details>
 </main>
+
+<!-- 화면 보호: 오래 손대지 않으면 검은 화면에 작은 상태 글자만, 위치를 계속 옮겨 가며 표시 -->
+<div id="saver" class="saver" aria-hidden="true">
+  <div id="saverBox" class="saver-box">
+    <div id="svTime" class="sv-time"></div>
+    <div id="svStat" class="sv-stat"></div>
+    <div class="sv-hint">화면을 누르면 돌아갑니다</div>
+  </div>
+</div>
 
 <script>
 /* ───────────── Govee 광고 패킷 해석 ─────────────
@@ -144,7 +162,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
   const QUEUE_MAX = 120000;      // 오프라인일 때 태블릿에 쌓아 두는 최대 건수 (센서 10대·1분 간격 ≈ 8일분)
   const BATCH = 500;
 
-  const cfg = Object.assign({ url: '', token: '', interval: 60, collector: 'tablet-1', only: '' }, LS.get('gv_cfg', {}));
+  const cfg = Object.assign({ url: '', token: '', interval: 60, collector: 'tablet-1', only: '', saverMin: 3 }, LS.get('gv_cfg', {}));
   // 대기열은 메모리에서는 [ts, id, temp, hum, batt, rssi], 저장할 때는 압축 형식으로 바꾼다
   // (센서ID는 번호로, 시각은 기준 시각과의 초 차이로, 온습도는 ×100 정수로 → 1건당 약 28자)
   function encodeQueue(q) {
@@ -170,7 +188,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
 
   // ── 설정 화면 ──
   $('cfgUrl').value = cfg.url; $('cfgToken').value = cfg.token;
-  $('cfgInterval').value = cfg.interval; $('cfgCollector').value = cfg.collector; $('cfgOnly').value = cfg.only;
+  $('cfgInterval').value = cfg.interval; $('cfgCollector').value = cfg.collector; $('cfgOnly').value = cfg.only; $('cfgSaver').value = cfg.saverMin;
   if (!cfg.url || !cfg.token) $('setBox').open = true;
   $('btnSave').onclick = () => {
     cfg.url = $('cfgUrl').value.trim();
@@ -178,6 +196,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     cfg.interval = Math.max(10, Number($('cfgInterval').value) || 60);
     cfg.collector = $('cfgCollector').value.trim() || 'tablet-1';
     cfg.only = $('cfgOnly').value.trim();
+    cfg.saverMin = Math.max(0, Number($('cfgSaver').value) || 0);
     LS.set('gv_cfg', cfg);
     restartRecorder();
     log('설정 저장됨');
@@ -380,6 +399,45 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     $('stLast').textContent = ago(lastUpTs);
   }
   setInterval(() => { updateStatus(); render(); }, 5000);
+
+  // ── 화면 보호 ──
+  // 같은 화면이 오래 떠 있지 않도록, 손대지 않은 지 cfg.saverMin분이 지나면 검은 화면으로 바꾸고
+  // 작은 시계·상태 글자를 20초마다 다른 위치로 옮긴다. 화면은 켜진 채라 블루투스 수신은 계속된다.
+  let lastTouch = Date.now();
+  const saver = $('saver'), box = $('saverBox');
+  let ignoreClicksUntil = 0;
+  const wake = () => {
+    lastTouch = Date.now();
+    if (saver.classList.contains('on')) {
+      saver.classList.remove('on');
+      ignoreClicksUntil = Date.now() + 600;   // 화면을 깨운 터치가 아래 버튼(수집 중지 등)을 누르지 않도록
+      render(); updateStatus();
+    }
+  };
+  document.addEventListener('click', (e) => { if (Date.now() < ignoreClicksUntil) { e.stopPropagation(); e.preventDefault(); } }, true);
+  ['pointerdown', 'keydown', 'touchstart'].forEach(ev => document.addEventListener(ev, wake, { passive: true }));
+  function saverTick() {
+    const idle = Date.now() - lastTouch;
+    if (!cfg.saverMin || idle < cfg.saverMin * 60000) return;
+    if (!saver.classList.contains('on')) saver.classList.add('on');
+    const d = new Date(), p = (n) => String(n).padStart(2, '0');
+    $('svTime').textContent = `${p(d.getHours())}:${p(d.getMinutes())}`;
+    const on = !!(scan && scan.active);
+    const quiet = on && lastAdvTs && Date.now() - lastAdvTs > 120000;
+    const fresh = [...latest.values()].filter(r => r.ts && Date.now() - r.ts < 120000).length;
+    let cls = '', txt;
+    if (!on) { cls = 'er'; txt = '수집 중지됨 — 화면을 눌러 수집 시작'; }
+    else if (quiet) { cls = 'wn'; txt = '센서 신호 끊김'; }
+    else if (lastUpOk === false) { cls = 'wn'; txt = `시트 전송 실패 · 대기 ${queue.length.toLocaleString()}건`; }
+    else txt = `수신 중 · 센서 ${fresh}대${queue.length ? ` · 대기 ${queue.length.toLocaleString()}건` : ''}`;
+    $('svStat').className = 'sv-stat ' + cls;
+    $('svStat').textContent = txt;
+    // 위치 옮기기
+    const w = box.offsetWidth || 260, h = box.offsetHeight || 100;
+    box.style.left = Math.round(Math.random() * Math.max(0, innerWidth - w)) + 'px';
+    box.style.top = Math.round(Math.random() * Math.max(0, innerHeight - h)) + 'px';
+  }
+  setInterval(saverTick, 20000);
 
   renderBanner();
   restartRecorder();
