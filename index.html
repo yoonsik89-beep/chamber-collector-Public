@@ -64,6 +64,14 @@
   .sensor .loc { color: var(--accent); font-weight: 600; }
   dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--card); color: var(--ink); padding: 18px; width: min(460px, 92vw); }
   dialog::backdrop { background: rgba(0,0,0,.4); }
+  .wx { display: flex; align-items: center; gap: 6px 16px; flex-wrap: wrap; background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 10px 14px; margin-bottom: 16px; font-size: 14px; color: var(--ink-2); }
+  .wx .ic { font-size: 26px; line-height: 1; }
+  .wx .t { font-size: 22px; font-weight: 650; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .wx .h { font-size: 18px; font-weight: 600; color: var(--ink); font-variant-numeric: tabular-nums; }
+  .wx .k { font-size: 12px; color: var(--ink-3); margin-right: 3px; }
+  .wx .src { margin-left: auto; font-size: 12px; color: var(--ink-3); }
+  .sv-wx { font-size: 14px; margin-top: 6px; color: #3d3d3b; }
   .saver { position: fixed; inset: 0; background: #000; display: none; z-index: 100; cursor: none; }
   .saver.on { display: block; }
   .saver-box { position: absolute; color: #4a4a48; text-align: center; transition: left 2s ease, top 2s ease; user-select: none; }
@@ -103,6 +111,7 @@
     <div class="pill"><div class="k">센서</div><div class="v" id="stSensors">-</div></div>
   </div>
   <div id="missTip" class="banner wn" style="display:none"></div>
+  <div id="wx" class="wx" style="display:none"></div>
 
   <div id="sensors" class="grid"><div class="empty">수집을 시작하면 주변 Govee 센서가 여기에 나타납니다.</div></div>
 
@@ -118,6 +127,12 @@
     <input id="cfgCollector">
     <label>화면 보호 시작 (분) — 이 시간 동안 손대지 않으면 화면을 어둡게 바꿉니다. 0이면 사용 안 함</label>
     <input id="cfgSaver" type="number" min="0" step="1">
+    <label>바깥 날씨 위치 — 대시보드와 같은 위치를 함께 씁니다</label>
+    <div class="row" style="margin-top:4px;align-items:center">
+      <input id="wxName" placeholder="표시 이름 (예: 마곡 R&D센터)" style="flex:1;min-width:180px">
+      <button id="wxHere">이 태블릿 위치로</button>
+    </div>
+    <div class="sub" id="wxMsg" style="margin-top:4px"></div>
     <label>수집할 센서 (비우면 모두) — 센서ID 일부를 쉼표로 구분</label>
     <input id="cfgOnly" placeholder="예: 5179_1A2B, 5179_3C4D">
     <div class="row">
@@ -156,6 +171,7 @@
   <div id="saverBox" class="saver-box">
     <div id="svTime" class="sv-time"></div>
     <div id="svStat" class="sv-stat"></div>
+    <div id="svWx" class="sv-wx"></div>
     <div class="sv-hint">화면을 누르면 돌아갑니다</div>
   </div>
 </div>
@@ -245,7 +261,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     restartRecorder();
     log('설정 저장됨');
     renderBanner();
-    fetchMeta();
+    fetchMeta(); fetchWeather();
   };
   $('btnTest').onclick = () => upload(true);
   $('btnRaw').onclick = () => { showRaw = !showRaw; $('btnRaw').textContent = showRaw ? '원시 신호 숨기기' : '원시 신호 보기'; render(); };
@@ -506,6 +522,64 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     } catch (e) { log('센서 이름 불러오기 실패: ' + e.message); }
   }
   setInterval(fetchMeta, 5 * 60000);   // 대시보드에서 바꾼 이름을 5분마다 반영
+
+  // ── 바깥 날씨 (Apps Script가 10분마다 받아 둔 값을 가져옴) ──
+  let wx = LS.get('gv_wx', null);
+  async function fetchWeather() {
+    if (!cfg.url || !cfg.token) return;
+    try {
+      const res = await fetch(`${cfg.url}?token=${encodeURIComponent(cfg.token)}&weather=1`);
+      const j = await res.json();
+      if (!j.ok) throw new Error(j.error || '응답 오류');
+      wx = j.weather; LS.set('gv_wx', wx);
+    } catch (e) { if (!wx) wx = { ok: false, error: e.message }; }
+    renderWeather();
+  }
+  function wxParts(w) {
+    const f1 = (v) => v == null ? '–' : (Math.round(v * 10) / 10).toFixed(1);
+    const f0 = (v) => v == null ? '–' : Math.round(v);
+    return { f1, f0 };
+  }
+  function renderWeather() {
+    const el = $('wx');
+    if (!wx) { el.style.display = 'none'; return; }
+    el.style.display = '';
+    if (!wx.ok) { el.innerHTML = `<span class="sub">바깥 날씨를 불러오지 못했습니다${wx.error ? ' (' + esc(wx.error) + ')' : ''} — 수집에는 영향이 없습니다</span>`; $('svWx').textContent = ''; return; }
+    const { f1, f0 } = wxParts(wx);
+    const parts = [
+      `<span class="ic" aria-hidden="true">${wx.icon}</span><b style="color:var(--ink)">${esc(wx.desc)}</b>`,
+      `<span><span class="k">기온</span><span class="t">${f1(wx.temp)}</span>°C</span>`,
+      `<span><span class="k">습도</span><span class="h">${f0(wx.hum)}</span>%RH</span>`,
+    ];
+    if (wx.feels != null) parts.push(`<span><span class="k">체감</span>${f1(wx.feels)}°C</span>`);
+    if (wx.tmax != null) parts.push(`<span><span class="k">최고/최저</span>${f0(wx.tmax)}° / ${f0(wx.tmin)}°</span>`);
+    if (wx.wind != null) parts.push(`<span><span class="k">바람</span>${f1(wx.wind)} m/s</span>`);
+    if (wx.rain) parts.push(`<span><span class="k">강수</span>${wx.rain} mm</span>`);
+    parts.push(`<span class="src">바깥 · ${esc(wx.loc.name)} · ${esc((wx.obsTime || '').slice(11, 16))} 기준 · ${wx.source === '기상청' ? '기상청' : 'Open-Meteo.com'}</span>`);
+    el.innerHTML = parts.join('');
+    $('svWx').textContent = `바깥 ${wx.icon} ${f1(wx.temp)}°C · ${f0(wx.hum)}%`;
+    if (!$('wxName').value && wx.loc) $('wxName').placeholder = `현재: ${wx.loc.name}`;
+  }
+  // 이 태블릿의 위치(GPS)를 날씨 위치로 저장 — 대시보드에도 같이 적용
+  $('wxHere').onclick = () => {
+    if (!cfg.url || !cfg.token) { $('wxMsg').textContent = 'Apps Script 주소와 비밀 문자열을 먼저 저장해 주세요.'; return; }
+    if (!navigator.geolocation) { $('wxMsg').textContent = '이 브라우저에서는 위치를 확인할 수 없습니다.'; return; }
+    $('wxHere').disabled = true; $('wxMsg').textContent = '현재 위치 확인 중…';
+    navigator.geolocation.getCurrentPosition(async (p) => {
+      try {
+        const loc = { name: $('wxName').value.trim() || '연구실 태블릿 위치', lat: p.coords.latitude, lon: p.coords.longitude };
+        const res = await fetch(cfg.url, { method: 'POST', body: JSON.stringify({ token: cfg.token, type: 'setWeatherLoc', loc }) });
+        const j = await res.json();
+        if (!j.ok) throw new Error(j.error || '저장 실패');
+        wx = j.weather; LS.set('gv_wx', wx); renderWeather();
+        $('wxMsg').textContent = `저장했습니다 — ${wx.loc.name} (${wx.loc.lat}, ${wx.loc.lon})`;
+        log('날씨 위치 저장: ' + wx.loc.name);
+      } catch (e) { $('wxMsg').textContent = '저장 실패: ' + e.message; }
+      finally { $('wxHere').disabled = false; }
+    }, (e) => { $('wxMsg').textContent = '위치를 확인하지 못했습니다: ' + e.message + ' (위치·GPS가 켜져 있는지 확인)'; $('wxHere').disabled = false; },
+    { enableHighAccuracy: false, timeout: 15000 });
+  };
+  setInterval(fetchWeather, 10 * 60000);
   let editId = null;
   function openEdit(id) {
     if (!cfg.url || !cfg.token) { alert('설정에서 Apps Script 주소와 비밀 문자열을 먼저 저장해 주세요.'); return; }
@@ -620,6 +694,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
   restartRecorder();
   updateScanUi();
   fetchMeta();
+  renderWeather(); fetchWeather();
   if (queue.length) log(`이전에 전송하지 못한 ${queue.length}건이 남아 있어 이어서 보냅니다`);
 })();
 </script>
