@@ -56,6 +56,9 @@
   .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
   .empty { color: var(--ink-3); padding: 24px; text-align: center; background: var(--card); border: 1px dashed var(--line); border-radius: 14px; }
   .sensor { position: relative; }
+  .sensor.missing { opacity: .55; border-style: dashed; }
+  .sensor.missing .big { color: var(--ink-3); }
+  .banner ol { margin: 6px 0 0; padding-left: 20px; }
   .sensor .edit { position: absolute; top: 10px; right: 10px; padding: 4px 10px; font-size: 16px; line-height: 1.2; color: var(--ink-2); }
   .sensor .name { padding-right: 44px; }
   .sensor .loc { color: var(--accent); font-weight: 600; }
@@ -78,7 +81,10 @@
       <h1>챔버 온습도 수집기</h1>
       <div class="sub">Govee 센서 블루투스 신호 → Google 시트 · 이 화면을 켜 둔 채로 두세요</div>
     </div>
-    <button id="btnScan" class="primary">수집 시작</button>
+    <div class="row" style="margin:0">
+      <button id="btnRescan" title="블루투스 수신을 다시 시작해 주변 센서를 새로 찾습니다">센서 다시 찾기</button>
+      <button id="btnScan" class="primary">수집 시작</button>
+    </div>
   </header>
 
   <div id="banner"></div>
@@ -88,7 +94,9 @@
     <div class="pill"><div class="k">시트 전송</div><div class="v" id="stUp">-</div></div>
     <div class="pill"><div class="k">전송 대기</div><div class="v" id="stQueue">0건</div></div>
     <div class="pill"><div class="k">마지막 전송</div><div class="v" id="stLast">-</div></div>
+    <div class="pill"><div class="k">센서</div><div class="v" id="stSensors">-</div></div>
   </div>
+  <div id="missTip" class="banner wn" style="display:none"></div>
 
   <div id="sensors" class="grid"><div class="empty">수집을 시작하면 주변 Govee 센서가 여기에 나타납니다.</div></div>
 
@@ -130,6 +138,7 @@
   <div class="sub" style="margin-top:8px">저장하면 노트북 대시보드에도 같은 이름으로 바로 반영됩니다. 습도 알람 범위는 대시보드에서 정합니다.</div>
   <div class="sub er" id="edMsg" style="min-height:20px;margin-top:6px"></div>
   <div class="row" style="justify-content:flex-end">
+    <button id="edForget" style="margin-right:auto">이 태블릿 목록에서 빼기</button>
     <button id="edCancel">취소</button><button id="edSave" class="primary" style="font-size:16px;padding:10px 18px">저장</button>
   </div>
 </dialog>
@@ -203,7 +212,13 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
   let queue = decodeQueue(LS.get('gv_queue2', null) || LS.get('gv_queue', []));
   try { localStorage.removeItem('gv_queue'); } catch {}
   const latest = new Map();                   // id -> reading
-  const nameById = new Map();                 // device.id -> name
+  // device.id -> 블루투스 이름. 한 번 알아낸 이름은 기억해 두어, 새로고침 후 이름 없는 신호도 바로 알아본다
+  const nameById = new Map(Object.entries(LS.get('gv_known', {})));
+  let knownDirty = false;
+  // 이 태블릿에서 한 번이라도 잡힌 센서 — 지금 안 잡히면 '찾는 중'으로 표시
+  const seen = new Set(LS.get('gv_seen', []));
+  const pendingIds = new Map();               // 이름을 아직 모르는 Govee 기기: device.id -> 마지막 수신 시각
+  let scanStartTs = 0;
   let scan = null, wakeLock = null, showRaw = false;
   let lastAdvTs = 0, lastUpOk = null, lastUpTs = 0, uploading = false;
 
@@ -254,8 +269,20 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
   // ── 블루투스 스캔 ──
   $('btnScan').onclick = async () => {
     if (scan && scan.active) { stopScan(); return; }
+    await startScan();
+  };
+  // 수신을 껐다 다시 켜서 주변 센서를 새로 찾는다(버튼을 눌러야만 가능 — 브라우저 보안 규칙)
+  $('btnRescan').onclick = async () => {
+    if (scan && scan.active) { try { scan.stop(); } catch {} }
+    pendingIds.clear();
+    log('센서 다시 찾기');
+    await new Promise(r => setTimeout(r, 400));
+    await startScan();
+  };
+  async function startScan() {
     try {
       scan = await navigator.bluetooth.requestLEScan({ acceptAllAdvertisements: true, keepRepeatedDevices: true });
+      scanStartTs = Date.now();
       log('블루투스 수신 시작');
       await keepAwake();
       updateScanUi();
@@ -264,7 +291,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
       alert('블루투스 수신을 시작하지 못했습니다.\n\n' + e.message +
         '\n\n확인: 블루투스 켜짐, 위치(GPS) 켜짐, Chrome의 위치·주변기기 권한 허용');
     }
-  };
+  }
   function stopScan() {
     try { scan && scan.stop(); } catch {}
     log('블루투스 수신 중지');
@@ -275,9 +302,14 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     navigator.bluetooth.addEventListener('advertisementreceived', (ev) => {
       const devId = ev.device.id;
       const name = ev.name || ev.device.name || nameById.get(devId) || '';
-      if (name) nameById.set(devId, name);
-      // 이름(센서ID)을 아직 모르는 신호는 건너뛴다 — 같은 센서가 이름 없는 항목으로 따로 잡히는 것을 막기 위함
-      if (!name) return;
+      if (name && nameById.get(devId) !== name) { nameById.set(devId, name); knownDirty = true; }
+      // 이름(센서ID)을 아직 모르는 신호는 기록하지 않고 '이름 확인 중'으로만 센다
+      // (같은 센서가 이름 없는 항목으로 따로 잡히는 것을 막기 위함, 보통 몇 초 안에 이름이 들어옴)
+      if (!name) {
+        for (const cid of ev.manufacturerData.keys()) if (cid === 0x8801 || cid === 0xEC88) { pendingIds.set(devId, Date.now()); scheduleRender(); }
+        return;
+      }
+      pendingIds.delete(devId);
       for (const [cid, dv] of ev.manufacturerData) {
         if (cid !== 0x8801 && cid !== 0xEC88 && !/govee|gvh|h51|h50/i.test(name)) continue;
         const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
@@ -285,6 +317,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
         if (cfg.only && !cfg.only.split(',').some(s => s.trim() && id.toLowerCase().includes(s.trim().toLowerCase()))) continue;
         const d = decodeGovee(cid, bytes);
         const raw = cid.toString(16).padStart(4, '0') + ' | ' + [...bytes].map(x => x.toString(16).padStart(2, '0')).join(' ');
+        if (d && !d.invalid && !seen.has(id)) { seen.add(id); LS.set('gv_seen', [...seen]); }
         const prev = latest.get(id) || {};
         latest.set(id, Object.assign(prev, { id, name, rssi: ev.rssi, raw, rawTs: Date.now() },
           d && !d.invalid ? { ts: Date.now(), temp: d.temp, hum: d.hum, batt: d.batt, model: d.model, bad: false } : { bad: true }));
@@ -390,10 +423,20 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     const box = $('sensors');
     const lab = (id) => meta.labels[id] || '', lc = (id) => meta.locations[id] || '';
     // 위치 → 이름 순으로 정렬(위치 없는 센서는 뒤로)
-    const list = [...latest.values()].sort((a, b) =>
+    // 지금 잡힌 센서 + 전에 잡혔는데 지금 안 보이는 센서('찾는 중')
+    const filt = (id) => !cfg.only || cfg.only.split(',').some(s => s.trim() && id.toLowerCase().includes(s.trim().toLowerCase()));
+    const missing = [...seen].filter(id => !latest.has(id) && filt(id)).map(id => ({ id, missing: true }));
+    const list = [...latest.values(), ...missing].sort((a, b) =>
       (lc(a.id) ? 0 : 1) - (lc(b.id) ? 0 : 1) || lc(a.id).localeCompare(lc(b.id), 'ko') || (lab(a.id) || a.id).localeCompare(lab(b.id) || b.id, 'ko'));
     if (!list.length) return;
     box.innerHTML = list.map(r => {
+      if (r.missing) return `<div class="sensor missing">
+        <button class="edit" data-id="${esc(r.id)}" title="이름·위치 바꾸기">✎</button>
+        <div class="name">${esc(lab(r.id) || r.id)}</div>
+        <div class="id">${lc(r.id) ? `<span class="loc">${esc(lc(r.id))}</span> · ` : ''}${esc(r.id)}</div>
+        <div class="vals"><div><span class="big">찾는 중…</span></div></div>
+        <div class="meta">이 태블릿에서 전에 잡혔던 센서입니다. 아직 신호가 없습니다.</div>
+      </div>`;
       const stale = !r.ts || Date.now() - r.ts > 120000;
       return `<div class="sensor">
         <button class="edit" data-id="${esc(r.id)}" title="이름·위치 바꾸기">✎</button>
@@ -437,6 +480,12 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     $('dlgEdit').showModal();
   }
   $('edCancel').onclick = () => $('dlgEdit').close();
+  // 다른 연구실로 옮긴 센서 등, 이 태블릿에서 더 이상 기다리지 않을 센서를 '찾는 중' 목록에서 뺀다
+  $('edForget').onclick = () => {
+    if (!confirm(`${editId}를 이 태블릿의 목록에서 뺄까요?\n(시트의 기록과 이름은 그대로이며, 다시 잡히면 목록에 돌아옵니다)`)) return;
+    seen.delete(editId); latest.delete(editId); LS.set('gv_seen', [...seen]);
+    $('dlgEdit').close(); render(); updateStatus();
+  };
   $('edSave').onclick = async () => {
     $('edSave').disabled = true; $('edMsg').textContent = '저장 중…';
     try {
@@ -465,6 +514,28 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     $('stUp').innerHTML = lastUpOk === null ? '-' : lastUpOk ? '<span class="ok">정상</span>' : '<span class="er">실패</span>';
     $('stQueue').textContent = `${queue.length.toLocaleString()}건`;
     $('stLast').textContent = ago(lastUpTs);
+    // 센서 수: 최근 2분 안에 값이 들어온 센서 / 이 태블릿이 알고 있는 센서
+    const filt = (id) => !cfg.only || cfg.only.split(',').some(s => s.trim() && id.toLowerCase().includes(s.trim().toLowerCase()));
+    const known = new Set([...seen, ...latest.keys()].filter(filt));
+    const live = [...latest.values()].filter(r => r.ts && Date.now() - r.ts < 120000).length;
+    for (const [k, t] of pendingIds) if (Date.now() - t > 60000) pendingIds.delete(k);
+    const pend = pendingIds.size;
+    $('stSensors').innerHTML = !known.size && !pend ? '-'
+      : `<span class="${live < known.size ? 'wn' : 'ok'}">${live} / ${known.size}대</span>${pend ? ` <span class="wn" style="font-size:12px">+ 이름 확인 중 ${pend}</span>` : ''}`;
+    // 시작 후 1분이 지났는데도 안 잡히는 센서가 있으면 안내
+    const missing = [...known].filter(id => { const r = latest.get(id); return !r || !r.ts || Date.now() - r.ts > 120000; });
+    const tip = $('missTip');
+    if (on && scanStartTs && Date.now() - scanStartTs > 60000 && missing.length) {
+      const lab = (id) => meta.labels[id] || id;
+      tip.style.display = '';
+      tip.innerHTML = `<b>안 잡히는 센서 ${missing.length}대:</b> ${missing.map(id => esc(lab(id))).join(', ')}
+        <ol>
+          <li><b>Govee Home 앱을 완전히 종료</b>하세요(설정 → 애플리케이션 → Govee Home → 강제 중지). 앱이 센서에 연결되어 있는 동안에는 센서가 신호를 보내지 않습니다.</li>
+          <li><b>센서 다시 찾기</b>를 누르세요.</li>
+          <li>그래도 안 되면 센서와 태블릿의 거리·벽(특히 금속 챔버 벽)과 센서 배터리를 확인하세요.</li>
+        </ol>`;
+    } else tip.style.display = 'none';
+    if (knownDirty) { knownDirty = false; LS.set('gv_known', Object.fromEntries(nameById)); }
   }
   setInterval(() => { updateStatus(); render(); }, 5000);
 
