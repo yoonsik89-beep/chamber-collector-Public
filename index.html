@@ -36,6 +36,15 @@
   .pill { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
   .pill .k { font-size: 12px; color: var(--ink-3); }
   .pill .v { font-size: 16px; font-weight: 600; }
+  .actbox { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin: 0 0 12px; }
+  .actbox .hd { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 13px; color: var(--ink-3); margin-bottom: 6px; flex-wrap: wrap; }
+  .actbar { position: relative; height: 18px; border-radius: 5px; background: repeating-linear-gradient(45deg, var(--line), var(--line) 3px, transparent 3px, transparent 6px); overflow: hidden; }
+  .actbar i { position: absolute; top: 0; bottom: 0; min-width: 1px; }
+  .actnet { position: relative; height: 5px; margin-top: 2px; }
+  .actnet i { position: absolute; top: 0; bottom: 0; background: #7a5cd6; min-width: 1px; border-radius: 2px; }
+  .actax { display: flex; justify-content: space-between; font-size: 11px; color: var(--ink-3); margin-top: 2px; }
+  .actlg { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--ink-2); margin-top: 6px; }
+  .actlg b { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 4px; vertical-align: -1px; }
   .ok { color: var(--good); } .wn { color: var(--warn); } .er { color: var(--bad); }
   .banner { border-radius: 12px; padding: 12px 14px; margin-bottom: 16px; font-size: 15px; }
   .banner.er { background: var(--bad-bg); } .banner.wn { background: var(--warn-bg); } .banner.ok { background: var(--good-bg); }
@@ -109,6 +118,13 @@
     <div class="pill"><div class="k">전송 대기</div><div class="v" id="stQueue">0건</div></div>
     <div class="pill"><div class="k">마지막 전송</div><div class="v" id="stLast">-</div></div>
     <div class="pill"><div class="k">센서</div><div class="v" id="stSensors">-</div></div>
+  </div>
+  <div class="actbox">
+    <div class="hd"><span><b style="color:var(--ink)">수집 일지</b> · 최근 24시간 이 태블릿이 실제로 기록했는지</span><span id="actNow"></span></div>
+    <div class="actbar" id="actBar"></div>
+    <div class="actnet" id="actNet" title="보라색: 인터넷 전송 실패(기록은 태블릿에 보관 후 나중에 전송)"></div>
+    <div class="actax"><span>24시간 전</span><span>12시간 전</span><span>지금</span></div>
+    <div class="actlg" id="actLg"></div>
   </div>
   <div id="missTip" class="banner wn" style="display:none"></div>
   <div id="wx" class="wx" style="display:none"></div>
@@ -245,6 +261,82 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
   let scanStartTs = 0;
   let scan = null, wakeLock = null, showRaw = false;
   let lastAdvTs = 0, lastUpOk = null, lastUpTs = 0, uploading = false;
+
+  // ── 수집 일지: 1분 단위로 '이 태블릿이 그때 무엇을 하고 있었는지' 남긴다 ──
+  // 끊긴 구간이 '기록은 있는데 아직 안 온 것'인지 '기록 자체가 없는 것'인지 대시보드에서 가려내기 위함
+  // R 수집(센서 신호 있음) · N 수집 중이나 센서 신호 없음 · H 화면 가려짐/꺼짐(수집 멈춤) · O 블루투스 수집 꺼짐 · X 수집 페이지 꺼짐
+  const ACT_KEEP_MIN = 3 * 24 * 60;
+  const ACT_INFO = {
+    R: ['#1a9e5c', '수집 중'], N: ['#e0a000', '센서 신호 없음'], H: ['#e2553b', '화면 가려짐·꺼짐 (수집 멈춤)'],
+    O: ['#9b9a94', '블루투스 수집 꺼짐'], X: ['#3a3a38', '수집 페이지 꺼짐'],
+  };
+  const act = Object.assign({ seg: [], net: [], tick: 0, hiddenAt: 0 }, LS.get('gv_act', {}));
+  const minOf = (ms) => Math.floor(ms / 60000);
+  function actAdd(list, s, e, c) {
+    const last = list[list.length - 1];
+    if (last && s < last[1]) s = last[1];
+    if (e < s) e = s;
+    if (last && last[2] === c && s <= last[1] + 1) { last[1] = Math.max(last[1], e); return; }
+    list.push([s, e, c]);
+  }
+  function actPrune() {
+    const lim = minOf(Date.now()) - ACT_KEEP_MIN;
+    act.seg = act.seg.filter(x => x[1] >= lim);
+    act.net = act.net.filter(x => x[1] >= lim);
+  }
+  function actSave() { actPrune(); LS.set('gv_act', act); }
+  // 페이지가 다시 열렸을 때: 마지막 기록 이후 지금까지는 '페이지 꺼짐'(또는 화면 가려진 채 종료)
+  (function actOnLoad() {
+    const nowM = minOf(Date.now());
+    if (act.tick && nowM - act.tick > 1) actAdd(act.seg, act.tick, nowM, act.hiddenAt ? 'H' : 'X');
+    act.hiddenAt = 0; act.tick = nowM; actSave();
+  })();
+  function actState() {
+    if (!(scan && scan.active)) return 'O';
+    const now = Date.now(), lim = Math.max(cfg.interval * 2000, 120000);
+    for (const r of latest.values()) if (r.ts && now - r.ts < lim) return 'R';
+    return 'N';
+  }
+  function actTick() {
+    if (document.hidden) return;                    // 가려진 동안은 돌아올 때 한꺼번에 기록
+    const nowM = minOf(Date.now());
+    actAdd(act.seg, Math.min(act.tick || nowM, nowM), nowM, actState());
+    act.tick = nowM; actSave(); renderAct();
+  }
+  document.addEventListener('visibilitychange', () => {
+    const nowM = minOf(Date.now());
+    if (document.hidden) { actTick(); act.hiddenAt = nowM; actSave(); }
+    else {
+      if (act.hiddenAt) { actAdd(act.seg, act.hiddenAt, nowM, 'H'); log(`화면이 ${nowM - act.hiddenAt}분 동안 가려져 있어 그동안 수집이 멈췄습니다`); }
+      act.hiddenAt = 0; act.tick = nowM; actSave(); renderAct();
+    }
+  });
+  function actNetFail() { const m = minOf(Date.now()); actAdd(act.net, m, m, 'F'); }
+  // 서버로 보낼 압축 문자열: 코드+시작분(36진수).길이(36진수), …
+  function actEncode(list, maxLen) {
+    let out = list.map(x => x[2] + x[0].toString(36) + '.' + (x[1] - x[0]).toString(36)).join(',');
+    if (out.length > maxLen) out = out.slice(out.length - maxLen).replace(/^[^,]*,/, '');
+    return out;
+  }
+  function pendingSummary() {
+    const p = {};
+    for (const r of queue) { const o = p[r[1]] || (p[r[1]] = [r[0], r[0], 0]); if (r[0] < o[0]) o[0] = r[0]; if (r[0] > o[1]) o[1] = r[0]; o[2]++; }
+    return p;
+  }
+  function renderAct() {
+    const bar = $('actBar'); if (!bar) return;
+    const end = Date.now(), start = end - 24 * 3600e3, span = end - start;
+    const pos = (s, e) => { const a = Math.max(s * 60000, start), b = Math.min((e + 1) * 60000, end); return b <= a ? null : `left:${((a - start) / span * 100).toFixed(3)}%;width:${((b - a) / span * 100).toFixed(3)}%`; };
+    const tot = {};
+    bar.innerHTML = act.seg.map(x => { const p = pos(x[0], x[1]); if (!p) return ''; tot[x[2]] = (tot[x[2]] || 0) + Math.min(x[1] + 1, minOf(end)) - Math.max(x[0], minOf(start)); return `<i style="${p};background:${ACT_INFO[x[2]][0]}" title="${ACT_INFO[x[2]][1]}"></i>`; }).join('');
+    $('actNet').innerHTML = act.net.map(x => { const p = pos(x[0], x[1]); return p ? `<i style="${p}"></i>` : ''; }).join('');
+    const fm = (m) => m >= 60 ? `${Math.floor(m / 60)}시간 ${m % 60}분` : `${m}분`;
+    $('actLg').innerHTML = Object.keys(ACT_INFO).map(k => `<span><b style="background:${ACT_INFO[k][0]}"></b>${ACT_INFO[k][1]}${tot[k] ? ' ' + fm(tot[k]) : ''}</span>`).join('') +
+      '<span><b style="background:#7a5cd6;height:5px;vertical-align:2px"></b>인터넷 전송 실패</span>';
+    const st = actState();
+    $('actNow').innerHTML = `지금: <b style="color:${ACT_INFO[st][0]}">${ACT_INFO[st][1]}</b>`;
+  }
+  setInterval(actTick, 20000);
 
   // ── 설정 화면 ──
   $('cfgUrl').value = cfg.url; $('cfgToken').value = cfg.token;
@@ -439,6 +531,8 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
       queue: queue.length,
       scanning: !!(scan && scan.active),
       lastAdvTs,
+      act: { seg: actEncode(act.seg, 6800), net: actEncode(act.net, 1500) },
+      pending: pendingSummary(),
       batchId: batch.length ? `${cfg.collector}-${batch[0][0]}-${batch[0][1]}-${batch.length}-${batch[batch.length - 1][0]}` : '',
       readings: batch.map(r => ({ ts: r[0], sensor: r[1], temp: r[2], hum: r[3], batt: r[4], rssi: r[5] })),
     };
@@ -454,6 +548,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
       if (queue.length >= BATCH) setTimeout(() => upload(false), 1500);   // 밀린 데이터 빠르게 비우기
     } catch (e) {
       lastUpOk = false;
+      actNetFail();
       log('전송 실패: ' + e.message);
       if (manual) alert('전송 실패: ' + e.message);
     } finally {
@@ -691,6 +786,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
   setInterval(saverTick, 20000);
 
   renderBanner();
+  actTick();
   restartRecorder();
   updateScanUi();
   fetchMeta();
