@@ -83,6 +83,14 @@
   .sv-wx { font-size: 14px; margin-top: 6px; color: #3d3d3b; }
   .saver { position: fixed; inset: 0; background: #000; display: none; z-index: 100; cursor: none; }
   .saver.on { display: block; }
+  .revive { position: fixed; inset: 0; z-index: 200; display: none; align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+    background: rgba(196,48,43,.94); color: #fff; text-align: center; padding: 24px; cursor: pointer; }
+  .revive.on { display: flex; }
+  .revive .t1 { font-size: clamp(30px, 6vw, 64px); font-weight: 800; line-height: 1.2; word-break: keep-all; }
+  .revive .t2 { font-size: clamp(16px, 2.4vw, 22px); opacity: .9; word-break: keep-all; }
+  .actev { margin-top: 8px; font-size: 12.5px; color: var(--ink-2); max-height: 120px; overflow-y: auto; }
+  .actev div { padding: 2px 0; border-top: 1px dashed var(--line); }
+  .actev b { font-variant-numeric: tabular-nums; margin-right: 6px; }
   .saver-box { position: absolute; color: #4a4a48; text-align: center; transition: left 2s ease, top 2s ease; user-select: none; }
   .sv-time { font-size: 44px; font-weight: 300; font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
   .sv-stat { font-size: 15px; margin-top: 4px; }
@@ -125,6 +133,7 @@
     <div class="actnet" id="actNet" title="보라색: 인터넷 전송 실패(기록은 태블릿에 보관 후 나중에 전송)"></div>
     <div class="actax"><span>24시간 전</span><span>12시간 전</span><span>지금</span></div>
     <div class="actlg" id="actLg"></div>
+    <div class="actev" id="actEv"></div>
   </div>
   <div id="missTip" class="banner wn" style="display:none"></div>
   <div id="wx" class="wx" style="display:none"></div>
@@ -181,6 +190,10 @@
 </dialog>
 
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
+<div id="revive" class="revive" role="button">
+  <div class="t1">👆 화면을 한 번 눌러 주세요</div>
+  <div class="t2">블루투스 수집이 멈췄습니다 (<span id="reviveWhy"></span>).<br>누르면 바로 다시 수집합니다 — 브라우저 보안상 터치가 있어야 다시 켤 수 있습니다.</div>
+</div>
 
 <!-- 화면 보호: 오래 손대지 않으면 검은 화면에 작은 상태 글자만, 위치를 계속 옮겨 가며 표시 -->
 <div id="saver" class="saver" aria-hidden="true">
@@ -272,6 +285,22 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
   };
   const act = Object.assign({ seg: [], net: [], tick: 0, hiddenAt: 0 }, LS.get('gv_act', {}));
   const minOf = (ms) => Math.floor(ms / 60000);
+  // 수집이 켜지고 꺼진 '이유' 기록 [분, 코드, 상황]
+  const EV_INFO = {
+    L: '페이지 새로 열림 (새로고침·크롬 재시작)', S: '수집 시작 버튼', T: '수집 중지 버튼 누름',
+    Z: '수집이 저절로 꺼짐', B: '태블릿 블루투스 꺼짐', b: '태블릿 블루투스 다시 켜짐',
+    A: '자동으로 수집 다시 시작', F: '자동 재시작 실패 → 화면 터치 필요', U: '화면 터치로 수집 다시 시작',
+  };
+  const EV_CTX = { b: '블루투스 꺼진 상태', f: '다른 창·팝업이 화면을 가림', h: '화면 가려짐·꺼짐' };
+  if (!Array.isArray(act.ev)) act.ev = [];
+  function actEvent(code, ctx) {
+    act.ev.push([minOf(Date.now()), code, ctx || '']);
+    if (act.ev.length > 200) act.ev.splice(0, act.ev.length - 200);
+    LS.set('gv_act', act);
+    const txt = EV_INFO[code] + (ctx ? ` (${ctx.split('').map(c => EV_CTX[c]).filter(Boolean).join(', ')})` : '');
+    try { log('[수집 일지] ' + txt); } catch (e) {}
+    try { renderAct(); } catch (e) {}
+  }
   function actAdd(list, s, e, c) {
     const last = list[list.length - 1];
     if (last && s < last[1]) s = last[1];
@@ -283,6 +312,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     const lim = minOf(Date.now()) - ACT_KEEP_MIN;
     act.seg = act.seg.filter(x => x[1] >= lim);
     act.net = act.net.filter(x => x[1] >= lim);
+    act.ev = (act.ev || []).filter(x => x[0] >= lim);
   }
   function actSave() { actPrune(); LS.set('gv_act', act); }
   // 페이지가 다시 열렸을 때: 마지막 기록 이후 지금까지는 '페이지 꺼짐'(또는 화면 가려진 채 종료)
@@ -333,6 +363,9 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     const fm = (m) => m >= 60 ? `${Math.floor(m / 60)}시간 ${m % 60}분` : `${m}분`;
     $('actLg').innerHTML = Object.keys(ACT_INFO).map(k => `<span><b style="background:${ACT_INFO[k][0]}"></b>${ACT_INFO[k][1]}${tot[k] ? ' ' + fm(tot[k]) : ''}</span>`).join('') +
       '<span><b style="background:#7a5cd6;height:5px;vertical-align:2px"></b>인터넷 전송 실패</span>';
+    const evs = (act.ev || []).filter(x => x[0] * 60000 >= start && x[1] !== 'S' && x[1] !== 'b').slice(-12).reverse();
+    $('actEv').innerHTML = evs.length ? evs.map(x => { const d = new Date(x[0] * 60000), p = n => String(n).padStart(2, '0');
+      return `<div><b>${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}</b>${EV_INFO[x[1]] || x[1]}${x[2] ? ' · ' + x[2].split('').map(c => EV_CTX[c]).filter(Boolean).join(', ') : ''}</div>`; }).join('') : '';
     const st = actState();
     $('actNow').innerHTML = `지금: <b style="color:${ACT_INFO[st][0]}">${ACT_INFO[st][1]}</b>`;
   }
@@ -384,9 +417,52 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
 
   // ── 블루투스 스캔 ──
   $('btnScan').onclick = async () => {
-    if (scan && scan.active) { stopScan(); return; }
-    await startScan();
+    if (scan && scan.active) {
+      // 실수로 눌러 몇 시간씩 수집이 멈추는 일을 막기 위해 한 번 더 확인
+      if (!confirm('블루투스 수집을 중지할까요?\n\n중지하면 다시 "수집 시작"을 누를 때까지 온습도가 기록되지 않습니다.')) return;
+      actEvent('T'); stopScan(); return;
+    }
+    if (reviving) return;                        // 화면 터치로 이미 다시 켜는 중
+    if (await startScan()) actEvent('S');
   };
+
+  // ── 수집 지킴이: '켜 두려고 한' 수집이 저절로 꺼지면 이유를 남기고 다시 켠다 ──
+  let want = LS.get('gv_want', false), lostMarked = false, reviving = false;
+  function setWant(v) { want = v; LS.set('gv_want', v); }
+  let btAvail = true;
+  if (navigator.bluetooth && navigator.bluetooth.getAvailability) navigator.bluetooth.getAvailability().then(v => { btAvail = v; }).catch(() => {});
+  if (navigator.bluetooth) navigator.bluetooth.addEventListener('availabilitychanged', (e) => {
+    btAvail = !!e.value;
+    actEvent(btAvail ? 'b' : 'B');
+    if (btAvail && want) setTimeout(() => guardTick(true), 2000);
+  });
+  function showRevive(why) { $('reviveWhy').textContent = why; $('revive').classList.add('on'); }
+  function hideRevive() { $('revive').classList.remove('on'); }
+  async function tryRevive(byTouch) {
+    if (reviving) return;
+    reviving = true;
+    try {
+      try { scan && scan.active && scan.stop(); } catch {}
+      if (await startScan(true)) actEvent(byTouch ? 'U' : 'A');
+      else if (!byTouch) { actEvent('F'); showRevive(btAvail ? '자동 재시작이 막힘' : '태블릿 블루투스 꺼짐'); }
+    } finally { reviving = false; }
+  }
+  function guardTick(force) {
+    if (!want || (scan && scan.active)) return;
+    if (!lostMarked) {
+      lostMarked = true;
+      const ctx = (btAvail ? '' : 'b') + (document.hasFocus && !document.hasFocus() ? 'f' : '') + (document.hidden ? 'h' : '');
+      actEvent('Z', ctx);
+    }
+    if (document.hidden) return;                 // 화면이 돌아오면 다시 시도
+    if (force || !$('revive').classList.contains('on')) tryRevive(false);
+  }
+  setInterval(guardTick, 10000);
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) setTimeout(guardTick, 800); });
+  // 화면 아무 곳이나 누르면(터치 = 브라우저가 허락하는 순간) 멈춘 수집을 다시 켬
+  ['pointerup', 'touchend', 'click'].forEach(ev => window.addEventListener(ev, () => {
+    if (want && !(scan && scan.active) && !reviving) tryRevive(true);
+  }, true));
   // 수신을 껐다 다시 켜서 주변 센서를 새로 찾는다(버튼을 눌러야만 가능 — 브라우저 보안 규칙)
   // 다시 찾는 동안(15초) 버튼에 남은 시간과 잡힌 센서 수를 보여 주고, 끝나면 결과를 알려 준다
   const RESCAN_MS = 15000;
@@ -422,22 +498,25 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
     t.textContent = text;
     clearTimeout(toast._t); toast._t = setTimeout(() => t.className = 'toast', 8000);
   }
-  async function startScan() {
+  async function startScan(silent) {
     try {
       scan = await navigator.bluetooth.requestLEScan({ acceptAllAdvertisements: true, keepRepeatedDevices: true });
       scanStartTs = Date.now();
+      setWant(true); lostMarked = false; hideRevive();
       log('블루투스 수신 시작');
       await keepAwake();
       updateScanUi();
       return true;
     } catch (e) {
       log('수신 시작 실패: ' + e.message);
+      if (silent) return false;
       alert('블루투스 수신을 시작하지 못했습니다.\n\n' + e.message +
         '\n\n확인: 블루투스 켜짐, 위치(GPS) 켜짐, Chrome의 위치·주변기기 권한 허용');
       return false;
     }
   }
   function stopScan() {
+    setWant(false);
     try { scan && scan.stop(); } catch {}
     log('블루투스 수신 중지');
     updateScanUi();
@@ -531,7 +610,7 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
       queue: queue.length,
       scanning: !!(scan && scan.active),
       lastAdvTs,
-      act: { seg: actEncode(act.seg, 6800), net: actEncode(act.net, 1500) },
+      act: { seg: actEncode(act.seg, 6000), net: actEncode(act.net, 1200), ev: (act.ev || []).slice(-60).map(x => x[1] + x[2] + '.' + x[0].toString(36)).join(',') },
       pending: pendingSummary(),
       batchId: batch.length ? `${cfg.collector}-${batch[0][0]}-${batch[0][1]}-${batch.length}-${batch[batch.length - 1][0]}` : '',
       readings: batch.map(r => ({ ts: r[0], sensor: r[1], temp: r[2], hum: r[3], batt: r[4], rssi: r[5] })),
@@ -786,6 +865,8 @@ if (typeof module !== 'undefined') module.exports = { decodeGovee };
   setInterval(saverTick, 20000);
 
   renderBanner();
+  actEvent('L');
+  if (want) setTimeout(() => { lostMarked = true; tryRevive(false); }, 1500);   // 수집 중이던 페이지가 새로 열렸으면 바로 다시 켜기
   actTick();
   restartRecorder();
   updateScanUi();
